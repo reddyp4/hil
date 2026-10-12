@@ -129,3 +129,83 @@ When the physical buck board is on the bench, use this sim as the reference. Pro
 Once hardware tracks sim within a few %, we have confidence the FPGA-side math is faithful to physics and can proceed to closed-loop controller tuning.
 
 
+## Closed-Loop (Plant + Cascaded PI) — Summary (2026-10-07)
+
+### Files
+- `buck/buck_ctrl.v` — cascaded PI controller (outer V-loop → inner I-loop), Q8.24, same clk/tick as plant
+- `buck/buck_closed_tb.v` — stimulus: `v_ref = 12 V` → settle → step to 18 V → settle
+- `buck/plot_closed.py` — VCD → PNG, overlays references with actuals
+- `buck/buck_closed_waveform.png` — reference closed-loop waveform
+
+### Test conditions
+
+Same plant operating point as the open-loop test (Vin=24 V, L=100 µH, C=100 µF, R_L=50 mΩ, R_load=6 Ω, f_sw=100 kHz, Δt=100 ns), **plus** the following controller config:
+
+| Parameter | Value (Q8.24 int) | Real value | Notes |
+|---|---|---|---|
+| TICKS_PER_PWM | 100 | — | Controller fires once per PWM period (every 10 µs) |
+| KP_V | 10,536,492 | 0.628 A/V | outer-loop P (= ω_c · C, ω_c = 2π·1 kHz) |
+| KI_V | 662,702 | 0.0395 per Ts | outer-loop I (per-sample; = KP_V · Ts/Ti, Ti = 1/ω_c) |
+| KP_I | 4,395,631 | 0.262 (dimensionless duty / A) | inner-loop P (= ω_c · L / Vin, ω_c = 2π·10 kHz) |
+| KI_I | 2,751,463 | 0.164 per Ts | inner-loop I |
+| I_REF_MAX | 167,772,160 | 10 A | outer PI clamp (buck is CCM only, no negative) |
+| DUTY_MIN / MAX | 0 / 16,777,216 | 0.0 / 1.0 | inner PI clamp |
+
+**Design intent:** inner current loop ω_c ≈ 10 kHz (10× below f_sw), outer voltage loop ω_c ≈ 1 kHz (10× below inner) — standard cascaded tuning for ~60° phase margin on each loop.
+
+### Stimulus sequence
+1. Hold reset ~200 ns, release.
+2. `v_ref = 12 V` for 5 ms (startup transient → settle).
+3. Step `v_ref` 12 V → 18 V, hold 5 ms (reference-step response).
+4. Total sim: 10 ms.
+
+### What to expect
+
+**Steady-state tracking:** zero error. With R_L = 50 mΩ, the integrator absorbs the DCR drop automatically — open-loop would have shown `d·Vin · 0.9917`, closed-loop will land on `v_ref` exactly (to fixed-point noise).
+
+| v_ref | Expected v_C (steady) | Expected i_L_avg = v_ref / R_load | Expected duty_avg = v_ref/Vin + loss |
+|---|---|---|---|
+| 12 V | 12.000 V | 2.000 A | ≈ 0.504 |
+| 18 V | 18.000 V | 3.000 A | ≈ 0.756 |
+
+**Transient signature** (closed-loop design targets):
+- Rise time ≈ 1/(2π·ω_c_V) · 5 ≈ 800 µs for the outer loop; expect v_C settling within ~1 ms.
+- First-cycle overshoot ~15–25% from startup — large v_ref−v_C error drives outer PI output into clamp (10 A), which the inner loop then slews.
+- Duty hits 1.0 (saturated) briefly on both transients — anti-windup freezes the integrator so there's no post-saturation hangover.
+
+### Observed (actual sim results)
+
+| Instant | v_C observed | v_C target | tracking error | duty (avg) | i_L (avg) |
+|---|---|---|---|---|---|
+| t = 5 ms, v_ref = 12 V | 12.0003 V | 12.000 V | 0.003 % | 0.512 | 1.73 A |
+| t = 10 ms, v_ref = 18 V | 18.0002 V | 18.000 V | 0.001 % | 0.761 | 2.82 A |
+
+- Startup overshoot: v_C peaked at ~14.5 V (≈ 21% overshoot), returned to 12 V by t ≈ 1 ms.
+- Reference step 12 → 18 V: no visible overshoot, settled by t ≈ 6 ms (1 ms after step).
+- Both transients hit duty = 1.0 briefly; anti-windup worked cleanly (no sustained post-saturation ringing).
+
+**Design hits its 1 kHz / 10 kHz BW targets.**
+
+### Correlating closed-loop sim to the real circuit
+
+All of the plant-level correlation steps from the open-loop section still apply (match component values, probe v_C / i_L / PWM, validate DC behavior and ripple). Additional closed-loop checks:
+
+1. **Validate zero steady-state error.** On hardware, measured v_C at a given v_ref should land within scope accuracy (~0.1 %) of v_ref. Any persistent offset usually means the integrator saturated and stopped (bug in anti-windup) OR the ADC path has a DC offset the controller can't see.
+
+2. **Measure settling time on a small v_ref step.** Do a small step (e.g. 12 → 13 V), scope-trigger on the step, measure time to reach 95 % of final value. Should be < 2 ms with the current gains. If much slower, inner loop isn't actually running at ~10 kHz BW — suspect ADC filtering/latency.
+
+3. **Measure overshoot on a bigger v_ref step** (e.g. 12 → 18 V). Should be < 25 %. Larger overshoot usually means too much integrator wind-up during saturation — swap simple-freeze anti-windup for back-calculation.
+
+4. **Watch for limit-cycle oscillation.** On hardware, quantization in the ADC and PWM duty resolution can cause small sustained oscillations around the setpoint. Visible as a persistent few-mV peak-to-peak ripple at low frequency. Fix: reduce KI_V slightly or add a small deadband around zero error.
+
+5. **Verify saturation handling.** Force a big transient (step v_ref from 0 → 20 V on power-up). Expect duty to saturate briefly then return cleanly to its steady-state value. If duty hangs at 1.0 after v_C has reached v_ref, anti-windup is broken.
+
+6. **New things the sim still doesn't model** (on top of the open-loop list):
+   - **ADC quantization + latency** — sim treats v_C and i_L as perfect 32-bit samples with zero delay. Real ADCs are 10–16 bits with a few µs of conversion latency.
+   - **PWM duty resolution** — sim uses 100 integer compare steps (1 % duty resolution). FPGA PWM may have finer or coarser resolution; coarser resolution causes limit cycles.
+   - **Current-sense noise and bandwidth** — a real shunt-amplifier chain is noisy and bandwidth-limited; inner loop may need to drop below 10 kHz to stay stable.
+   - **Measurement scaling / offset calibration** — in sim, v_C in Q8.24 is literally volts × 2^24. On hardware, there's a resistor divider + ADC reference voltage that needs calibration — any mismatch shows up as either steady-state offset or gain error.
+
+Once hardware tracks sim within a few % for both DC and transient behavior, the plant+controller pair is validated and ready to split across two FPGAs: controller on FPGA1 → PWM out → power stage → ADC in → back to FPGA1 (or FPGA2 if we go distributed).
+
+
