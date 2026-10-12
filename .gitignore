@@ -1,18 +1,18 @@
-# Temporary files
-*.tmp
-*.temp
-*~
+# Simulation artifacts — regenerable from Verilog sources
+*.vcd
+*.vvp
+*.fst
+*.gtkw
 
-# Temporary directories
-tmp/
-temp/
-.tmp/
+# Python
+__pycache__/
+*.pyc
+*.pyo
 
-# Editor swap and backup files
-*.swp
-*.swo
-*.bak
-
-# OS metadata
-.DS_Store
+# OS cruft
 Thumbs.db
+.DS_Store
+
+# Office autosave
+~$*
+.~lock.*
